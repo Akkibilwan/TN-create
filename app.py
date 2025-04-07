@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import os
 import io
@@ -5,16 +6,17 @@ import base64
 import zipfile
 from datetime import datetime
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI # Ensure OpenAI library is installed: pip install openai
 import re
-import pathlib
+import pathlib # For path manipulation
+# import shutil # Not strictly needed as zipfile handles folder zipping
 import time
-from dotenv import load_dotenv
-
-load_dotenv()  # Load environment variables from .env (if available)
+import requests # Needed for downloading generated image if URL is returned (though using b64)
+import random # To select random images for style analysis
 
 # --- Configuration ---
-LIBRARY_DIR = "thumbnail_library"
+LIBRARY_DIR = "thumbnail_library" # Main directory for storing category folders
+STYLE_ANALYSIS_SAMPLE_SIZE = 3 # Number of images to analyze for category style
 
 # --- Updated Standard Category Definitions (Now with descriptions) ---
 STANDARD_CATEGORIES_WITH_DESC = [
@@ -45,8 +47,8 @@ STANDARD_CATEGORIES = [cat['name'] for cat in STANDARD_CATEGORIES_WITH_DESC]
 
 # Set page configuration
 st.set_page_config(
-    page_title="Thumbnail Toolkit (Analyze & Generate)",
-    page_icon="🖼️",
+    page_title="Thumbnail Toolkit (Analyze & Generate)", # Updated Title
+    page_icon="🖼️", # Changed icon
     layout="wide"
 )
 
@@ -60,12 +62,12 @@ st.markdown("""
         padding: 10px;
         margin-bottom: 15px;
         background-color: #f9f9f9;
-        position: relative;
+        position: relative; /* Needed for absolute positioning of delete button */
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        height: 100%;
+        height: 100%; /* Make containers equal height in a row */
         display: flex;
         flex-direction: column;
-        justify-content: space-between;
+        justify-content: space-between; /* Push button to bottom */
     }
     .analysis-box {
         margin-top: 10px;
@@ -74,17 +76,18 @@ st.markdown("""
         border-radius: 4px;
         border: 1px solid #ced4da;
     }
-    .analysis-box p {
+    .analysis-box p { /* Style paragraphs inside analysis box */
        margin-bottom: 5px;
        font-size: 0.9em;
     }
     .delete-button-container {
-        margin-top: 10px;
-        text-align: center;
+        /* Removed absolute positioning, button flows naturally */
+        margin-top: 10px; /* Add space above the button */
+        text-align: center; /* Center the button */
     }
     .delete-button-container button {
-       width: 80%;
-       background-color: #dc3545;
+       width: 80%; /* Make delete button slightly smaller */
+       background-color: #dc3545; /* Red color */
        color: white;
        border: none;
        padding: 5px 10px;
@@ -93,15 +96,16 @@ st.markdown("""
        transition: background-color 0.2s ease;
     }
     .delete-button-container button:hover {
-        background-color: #c82333;
+        background-color: #c82333; /* Darker red on hover */
     }
-    .stButton>button {
+    .stButton>button { /* Style general Streamlit buttons */
         border-radius: 5px;
         padding: 8px 15px;
     }
-    .stDownloadButton>button {
+    .stDownloadButton>button { /* Style download buttons */
         width: 100%;
     }
+     /* Ensure generated image fits well */
     .generated-image-container img {
         max-width: 100%;
         height: auto;
@@ -121,26 +125,31 @@ st.markdown("""
 # ---------- Filesystem Library Functions ----------
 
 def sanitize_foldername(name):
+    # (Sanitize function remains the same)
     name = name.strip()
+    # Remove or replace characters invalid in Windows/Linux/macOS folder names
+    # Including .,; which might cause issues in some contexts
     name = re.sub(r'[<>:"/\\|?*.,;]+', '_', name)
+    # Replace multiple consecutive underscores with a single one
     name = re.sub(r'_+', '_', name)
+    # Handle reserved names in Windows
     if name.upper() in ["CON", "PRN", "AUX", "NUL"] or re.match(r"^(COM|LPT)[1-9]$", name.upper()):
         name = f"_{name}_"
     return name if name else "uncategorized"
 
-
 def ensure_library_dir():
-    try:
-        pathlib.Path(LIBRARY_DIR).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        st.error(f"Error creating library directory: {e}")
+    # (Ensure dir function remains the same)
+    pathlib.Path(LIBRARY_DIR).mkdir(parents=True, exist_ok=True)
 
-
+# Function to Pre-create Standard Category Folders
 def create_predefined_category_folders(category_list):
+    """Creates folders for standard categories if they don't exist."""
     ensure_library_dir()
+    # st.sidebar.write("Checking standard category folders...") # Less verbose
     created_count = 0
-    for category_name in category_list:
+    for category_name in category_list: # Now iterates through names only
         sanitized_name = sanitize_foldername(category_name)
+        # Avoid creating folders for generic/empty names unless explicitly desired
         if not sanitized_name or sanitized_name in ["uncategorized", "other_unclear"]:
             continue
 
@@ -151,88 +160,98 @@ def create_predefined_category_folders(category_list):
                 created_count += 1
             except Exception as e:
                 st.sidebar.warning(f"Could not create folder for '{category_name}': {e}")
+    # Show message only if folders were created
     if created_count > 0:
         st.sidebar.caption(f"Created {created_count} new category folders.")
 
 
+# Modified for single label, handles bytes input
 def save_image_to_category(image_bytes, label, original_filename="thumbnail"):
+    """Saves image bytes to the specified category folder."""
     ensure_library_dir()
     if not label or label in ["Uncategorized", "Other / Unclear"]:
         st.warning(f"Cannot save image '{original_filename}' with label '{label}'. Please select a valid category.")
         return False, None
 
+    # Sanitize base filename more aggressively
+    base_filename, _ = os.path.splitext(original_filename)
+    base_filename_sanitized = re.sub(r'[^\w\-]+', '_', base_filename).strip('_')[:50] # Max 50 chars
+    if not base_filename_sanitized: base_filename_sanitized = "image" # Fallback if name becomes empty
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19] # microseconds added
+
+    sanitized_label = sanitize_foldername(label)
+    category_path = pathlib.Path(LIBRARY_DIR) / sanitized_label
+    category_path.mkdir(parents=True, exist_ok=True) # Create just in case
+
+    # Determine file extension (try to keep original if known, default to jpg)
+    # For generated images (b64 from DALL-E is usually PNG) or processed uploads (we convert to JPG)
+    file_extension = ".jpg" # Default for processed uploads
     try:
-        base_filename, _ = os.path.splitext(original_filename)
-        base_filename_sanitized = re.sub(r'[^\w\-]+', '_', base_filename).strip('_')[:50]
-        if not base_filename_sanitized:
-            base_filename_sanitized = "image"
+        # Check common magic numbers
+        if image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+            file_extension = ".png"
+        elif image_bytes.startswith(b'\xff\xd8\xff'):
+            file_extension = ".jpg"
+        elif image_bytes.startswith(b'RIFF') and image_bytes[8:12] == b'WEBP':
+             file_extension = ".webp"
+        # Add more checks if needed (GIF, etc.)
+    except Exception:
+        pass # Keep default if check fails or bytes too short
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+    # If original filename had a known extension, maybe prioritize it?
+    # _, orig_ext = os.path.splitext(original_filename)
+    # if orig_ext.lower() in ['.png', '.webp', '.jpeg', '.jpg']:
+    #    file_extension = orig_ext.lower() # Consider using original extension
 
-        sanitized_label = sanitize_foldername(label)
-        category_path = pathlib.Path(LIBRARY_DIR) / sanitized_label
-        category_path.mkdir(parents=True, exist_ok=True)
-
-        file_extension = ".jpg"
-        try:
-            if image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-                file_extension = ".png"
-            elif image_bytes.startswith(b'\xff\xd8\xff'):
-                file_extension = ".jpg"
-            elif image_bytes.startswith(b'RIFF') and image_bytes[8:12] == b'WEBP':
-                file_extension = ".webp"
-        except Exception:
-            pass
-
-        filename = f"{base_filename_sanitized}_{timestamp}{file_extension}"
+    filename = f"{base_filename_sanitized}_{timestamp}{file_extension}"
+    filepath = category_path / filename
+    counter = 1
+    while filepath.exists():
+        # Append counter if filename collision
+        filename = f"{base_filename_sanitized}_{timestamp}_{counter}{file_extension}"
         filepath = category_path / filename
-        counter = 1
-        while filepath.exists():
-            filename = f"{base_filename_sanitized}_{timestamp}_{counter}{file_extension}"
-            filepath = category_path / filename
-            counter += 1
+        counter += 1
 
+    try:
         with open(filepath, "wb") as f:
             f.write(image_bytes)
         return True, str(filepath)
-
     except Exception as e:
         st.error(f"Error saving image to '{filepath}': {e}")
         return False, None
 
 
 def get_categories_from_folders():
+    # (Function remains the same)
     ensure_library_dir()
     try:
+        # List directories, filter out hidden ones (like .DS_Store) and potentially unusable ones
         return sorted([d.name for d in pathlib.Path(LIBRARY_DIR).iterdir() if d.is_dir() and not d.name.startswith('.')])
     except FileNotFoundError:
         return []
-    except Exception as e:
-        st.error(f"Error getting categories: {e}")
-        return []
-
 
 def get_images_in_category(category_name):
-    try:
-        sanitized_category = sanitize_foldername(category_name)
-        category_path = pathlib.Path(LIBRARY_DIR) / sanitized_category
-        image_files = []
-        if category_path.is_dir():
-            for item in category_path.iterdir():
-                if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png',
-                                                             '.webp'] and not item.name.startswith('.'):
-                    image_files.append(item)
-        return sorted(image_files, key=os.path.getmtime, reverse=True)
-    except Exception as e:
-        st.error(f"Error getting images in category: {e}")
-        return []
+    # (Function remains the same)
+    sanitized_category = sanitize_foldername(category_name)
+    category_path = pathlib.Path(LIBRARY_DIR) / sanitized_category
+    image_files = []
+    if category_path.is_dir():
+        for item in category_path.iterdir():
+            # Check for common image extensions, ignore hidden files
+            if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp'] and not item.name.startswith('.'):
+                image_files.append(item)
+    # Sort by modification time, newest first (or change if needed, e.g., random for sampling)
+    # Let's keep newest first for general Browse, sampling will handle selection later
+    return sorted(image_files, key=os.path.getmtime, reverse=True)
 
 
 def delete_image_file(image_path_str):
+    # (Function remains the same)
     try:
         file_path = pathlib.Path(image_path_str)
         if file_path.is_file():
-            file_path.unlink()
+            file_path.unlink() # Delete the file
             st.toast(f"Deleted: {file_path.name}", icon="🗑️")
             return True
         else:
@@ -242,96 +261,103 @@ def delete_image_file(image_path_str):
         st.error(f"Error deleting file {image_path_str}: {e}")
         return False
 
-
+# ---------- NEW: Function to create Zip File of Entire Library ----------
 def create_zip_of_library():
+    """Creates a zip file containing all category folders and their images."""
     ensure_library_dir()
     zip_buffer = io.BytesIO()
     added_files_count = 0
     library_path = pathlib.Path(LIBRARY_DIR)
 
-    if not any(library_path.iterdir()):
+    if not any(library_path.iterdir()): # Check if library directory is empty
         return None, 0
 
-    try:
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for category_folder in library_path.iterdir():
-                if category_folder.is_dir() and not category_folder.name.startswith('.'):
-                    for item in category_folder.iterdir():
-                        if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png',
-                                                                     '.webp'] and not item.name.startswith('.'):
-                            try:
-                                arcname = f"{category_folder.name}/{item.name}"
-                                zipf.write(item, arcname=arcname)
-                                added_files_count += 1
-                            except Exception as zip_err:
-                                st.warning(f"Could not add {item.name} to zip: {zip_err}")
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Iterate through each category folder in the library directory
+        for category_folder in library_path.iterdir():
+            if category_folder.is_dir() and not category_folder.name.startswith('.'):
+                # Iterate through files within the category folder
+                for item in category_folder.iterdir(): # Use iterdir instead of glob('*')
+                      if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp'] and not item.name.startswith('.'):
+                          try:
+                              # Add file to zip, preserving directory structure
+                              arcname = f"{category_folder.name}/{item.name}"
+                              zipf.write(item, arcname=arcname)
+                              added_files_count += 1
+                          except Exception as zip_err:
+                              st.warning(f"Could not add {item.name} to zip: {zip_err}")
 
-        if added_files_count == 0:
-            return None, 0
+    if added_files_count == 0:
+        return None, 0 # No files were added
 
-        zip_buffer.seek(0)
-        return zip_buffer, added_files_count
-
-    except Exception as e:
-        st.error(f"Error creating zip of library: {e}")
-        return None, 0
+    zip_buffer.seek(0)
+    return zip_buffer, added_files_count
 
 
 # ---------- OpenAI API Setup ----------
-
 def setup_openai_client():
+    # (setup_openai_client remains the same)
     api_key = None
+    # Try Streamlit secrets
+    if hasattr(st, 'secrets') and "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    else:
+        # Try environment variables
+        api_key = os.environ.get('OPENAI_API_KEY')
+
+    # If not found, ask user in sidebar
+    if not api_key:
+        api_key = st.sidebar.text_input(
+            "Enter OpenAI API key:",
+            type="password",
+            key="api_key_input_sidebar",
+            help="Required for analyzing and generating thumbnails."
+        )
+
+    if not api_key:
+        # st.sidebar.warning("OpenAI API key is missing.") # Show warning persistently if needed
+        return None # Return None if no key
+
     try:
-        if hasattr(st, 'secrets') and "OPENAI_API_KEY" in st.secrets:
-            api_key = st.secrets["OPENAI_API_KEY"]
-        else:
-            api_key = os.environ.get('OPENAI_API_KEY')
-
-        if not api_key:
-            api_key = st.sidebar.text_input(
-                "Enter OpenAI API key:",
-                type="password",
-                key="api_key_input_sidebar",
-                help="Required for analyzing and generating thumbnails."
-            )
-
-        if not api_key:
-            st.sidebar.warning("OpenAI API key is missing.")
-            return None
-
         client = OpenAI(api_key=api_key)
-        # client.models.list()  # Optional: Test call
+        # Optional: Add a simple test call here if needed to verify key
+        # client.models.list()
         return client
-
     except Exception as e:
         st.sidebar.error(f"Error initializing OpenAI client: {e}. Check API key.")
         return None
 
 
 # ---------- Utility Function ----------
-
 def encode_image(image_bytes):
+    # (encode_image remains the same)
     return base64.b64encode(image_bytes).decode('utf-8')
 
-
 # ---------- OpenAI Analysis & Classification Function (Updated Categories) ----------
-
 def analyze_and_classify_thumbnail(client: OpenAI, image_bytes: bytes):
+    """ Analyzes thumbnail for the single most relevant label from the expanded list. """
     if not client:
         return "Uncategorized", "OpenAI client not initialized."
 
+    base64_image = encode_image(image_bytes)
+    # Try to infer mime type for better accuracy, default to jpeg
+    mime_type = "image/jpeg"
+    if image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+        mime_type = "image/png"
+    elif image_bytes.startswith(b'RIFF') and image_bytes[8:12] == b'WEBP':
+        mime_type = "image/webp"
+    image_data_uri = f"data:{mime_type};base64,{base64_image}"
+
+    # --- Use Category Definitions from STANDARD_CATEGORIES_WITH_DESC ---
+    category_definitions_list = [f"{cat['name']}: {cat['description']}" for cat in STANDARD_CATEGORIES_WITH_DESC]
+    category_definitions_text = "\n".join([f"- {cat_def}" for cat_def in category_definitions_list])
+
+    # --- Use STANDARD_CATEGORIES list for validation ---
+    valid_categories = set(STANDARD_CATEGORIES)
+
     try:
-        base64_image = encode_image(image_bytes)
-        image_data_uri = f"data:image/jpeg;base64,{base64_image}"
-
-        category_definitions_list = [f"{cat['name']}: {cat['description']}" for cat in
-                                     STANDARD_CATEGORIES_WITH_DESC]
-        category_definitions_text = "\n".join([f"- {cat_def}" for cat_def in category_definitions_list])
-
-        valid_categories = set(STANDARD_CATEGORIES)
-
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o", # Use the specified model
             messages=[
                 {
                     "role": "system",
@@ -346,97 +372,189 @@ def analyze_and_classify_thumbnail(client: OpenAI, image_bytes: bytes):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": image_data_uri, "detail": "low"}
+                            "image_url": {"url": image_data_uri, "detail": "low"} # Use low detail for faster analysis
                         }
                     ]
                 }
             ],
-            temperature=0.1,
-            max_tokens=50
+            temperature=0.1, # Low temperature for consistency
+            max_tokens=50 # Slightly increased buffer for longer names like 'Arrow/Circle Emphasis'
         )
         result = response.choices[0].message.content.strip()
 
-        label = "Uncategorized"
-        reason = "Analysis complete."
+    except Exception as e:
+        st.error(f"Error during OpenAI analysis: {e}")
+        return "Uncategorized", "Analysis failed due to an API error."
 
+    # Validate the single label output
+    label = "Uncategorized" # Default
+    reason = "Analysis complete." # Simple default reason
+
+    try:
         if result:
             found = False
+            # Check against STANDARD_CATEGORIES (case-insensitive comparison)
             for valid_cat in valid_categories:
                 if valid_cat.strip().lower() == result.strip().lower():
-                    label = valid_cat
+                    label = valid_cat # Use the official casing from STANDARD_CATEGORIES
                     found = True
                     break
             if not found:
-                st.warning(
-                    f"AI returned unrecognized category: '{result}'. Classifying as 'Other / Unclear'.")
+                st.warning(f"AI returned unrecognized category: '{result}'. Classifying as 'Other / Unclear'.")
+                # Fallback to 'Other / Unclear' if defined, else 'Uncategorized'
                 label = "Other / Unclear" if "Other / Unclear" in valid_categories else "Uncategorized"
         else:
             st.warning("AI returned an empty category response. Classifying as 'Uncategorized'.")
             label = "Uncategorized"
 
-        return label, reason
+    except Exception as parse_error:
+        st.warning(f"Could not process AI label response: '{result}'. Error: {parse_error}. Classifying as 'Uncategorized'.")
+        label = "Uncategorized"
+
+    # The 'reason' part isn't really used or stored meaningfully anymore with the single label focus.
+    return label, reason
+
+
+# ---------- NEW: Function to Analyze Category Style --------
+def analyze_category_style(client: OpenAI, category_name: str, sample_size: int = STYLE_ANALYSIS_SAMPLE_SIZE):
+    """Analyzes sample images from a category to describe its common visual style."""
+    if not client:
+        return None, "OpenAI client not initialized."
+
+    image_files = get_images_in_category(category_name)
+    if not image_files:
+        return None, f"No images found in category '{category_name}' to analyze style."
+
+    # Select a sample of images (e.g., random or newest)
+    # Using random sample for potentially better style diversity representation
+    if len(image_files) <= sample_size:
+        sample_files = image_files
+    else:
+        sample_files = random.sample(image_files, sample_size)
+
+    if not sample_files:
+         return None, f"Could not select sample images from '{category_name}'."
+
+    st.write(f"Analyzing style based on {len(sample_files)} sample image(s) from '{category_name}'...")
+
+    image_messages = []
+    try:
+        for img_path in sample_files:
+            with open(img_path, "rb") as f:
+                img_bytes = f.read()
+            base64_image = encode_image(img_bytes)
+            # Infer mime type
+            mime_type = "image/jpeg"
+            if img_bytes.startswith(b'\x89PNG\r\n\x1a\n'): mime_type = "image/png"
+            elif img_bytes.startswith(b'RIFF') and img_bytes[8:12] == b'WEBP': mime_type = "image/webp"
+
+            image_messages.append(
+                 {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{base64_image}", "detail": "low"}
+                 }
+            )
+    except Exception as e:
+        return None, f"Error reading or encoding sample images: {e}"
+
+    # Construct the prompt for GPT-4o
+    analysis_prompt_text = (
+        "Analyze the common visual elements and style patterns across the following YouTube thumbnail images from the same category. "
+        "Focus on:\n"
+        "- **Layout:** (e.g., split-screen, centered subject, text position)\n"
+        "- **Color Palette:** (e.g., high contrast, muted tones, specific dominant colors)\n"
+        "- **Typography Style:** (if prominent: e.g., bold sans-serif, handwritten, minimal text)\n"
+        "- **Key Visual Elements:** (e.g., close-up faces, product shots, graphics, icons)\n"
+        "- **Overall Mood/Feeling:** (e.g., energetic, serious, intriguing, clean)\n\n"
+        "Provide a concise description (2-3 sentences) summarizing the dominant and recurring style characteristics suitable for guiding the generation of a *new* thumbnail in this same style. Do not describe individual images, but the *shared* style."
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an expert visual style analyst for YouTube thumbnails."
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": analysis_prompt_text}
+            ] + image_messages # Append image data
+        }
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o", # Use vision-capable model
+            messages=messages,
+            temperature=0.3, # Slightly creative but focused on analysis
+            max_tokens=150 # Enough for a concise style description
+        )
+        style_description = response.choices[0].message.content.strip()
+        if not style_description:
+             return None, "Style analysis returned an empty description."
+        return style_description, "Style analysis successful."
 
     except Exception as e:
-        st.error(f"Error during OpenAI analysis: {e}")
-        return "Uncategorized", f"Analysis failed: {e}"
+        st.error(f"Error during category style analysis: {e}")
+        return None, f"Style analysis failed due to an API error: {e}"
 
 
 # ---------- Callbacks ----------
-
 def add_to_library_callback(file_id, image_bytes, label, filename):
-    try:
-        success, saved_path = save_image_to_category(image_bytes, label, filename)
-        if success:
-            if 'upload_cache' in st.session_state and file_id in st.session_state.upload_cache:
-                st.session_state.upload_cache[file_id]['status'] = 'added'
+    """Callback to save an image (uploaded or generated) to the library."""
+    # Note: file_id helps manage state for uploaded items, less critical for generated ones unless tracking saved status
+    success, saved_path = save_image_to_category(image_bytes, label, filename)
+    if success:
+        # Update status for uploaded items if applicable
+        if 'upload_cache' in st.session_state and file_id in st.session_state.upload_cache:
+            st.session_state.upload_cache[file_id]['status'] = 'added'
 
-            if file_id.startswith("gen_"):
-                st.session_state.generated_image_saved = True
+        # Set flag for generated images if applicable (check file_id prefix or specific state)
+        # Use a general 'generated_image_saved' flag, assuming only one gen image is active at a time
+        if file_id.startswith("gen_"): # Check if it's from a generator context
+            st.session_state.generated_image_saved = True # Mark as saved
 
-            st.toast(f"Image saved to '{label}' folder!", icon="✅")
-        else:
-            st.toast(f"Failed to save image to '{label}'.", icon="❌")
-        st.rerun()
+        st.toast(f"Image saved to '{label}' folder!", icon="✅")
+    else:
+        st.toast(f"Failed to save image to '{label}'.", icon="❌")
 
-    except Exception as e:
-        st.error(f"Error in add_to_library_callback: {e}")
+    # Rerun to update button states (e.g., "Added", "Saved")
+    # For generated images, setting the flag might be enough, rerun updates the button.
+    st.rerun()
 
 
 def add_direct_to_library_callback(file_id, image_bytes, selected_category, filename):
-    try:
-        success, _ = save_image_to_category(image_bytes, selected_category, filename)
-        if success:
-            st.session_state[f'direct_added_{file_id}'] = True
-            st.toast(f"Image added to '{selected_category}' folder!", icon="⬆️")
-            st.rerun()
-        else:
-            st.toast(f"Failed to add image directly to '{selected_category}'.", icon="❌")
-    except Exception as e:
-        st.error(f"Error in add_direct_to_library_callback: {e}")
-
+    # (Callback remains largely the same)
+    success, _ = save_image_to_category(image_bytes, selected_category, filename)
+    if success:
+        # Use a unique key to track added status for direct uploads
+        st.session_state[f'direct_added_{file_id}'] = True
+        st.toast(f"Image added to '{selected_category}' folder!", icon="⬆️")
+        st.rerun() # Rerun to update the button state in the expander
+    else:
+        st.toast(f"Failed to add image directly to '{selected_category}'.", icon="❌")
 
 def analyze_all_callback():
-    try:
-        if 'upload_cache' in st.session_state:
-            triggered_count = 0
-            for file_id, item_data in st.session_state.upload_cache.items():
-                if isinstance(item_data, dict) and item_data.get('status') == 'uploaded':
-                    st.session_state.upload_cache[file_id]['status'] = 'analyzing'
-                    triggered_count += 1
-            if triggered_count > 0:
-                st.toast(f"Triggered analysis for {triggered_count} thumbnail(s).", icon="🧠")
-            else:
-                st.toast("No thumbnails awaiting analysis.", icon="🤷")
-    except Exception as e:
-        st.error(f"Error in analyze_all_callback: {e}")
+    # (Callback remains the same)
+    if 'upload_cache' in st.session_state:
+        triggered_count = 0
+        for file_id, item_data in st.session_state.upload_cache.items():
+            # Only trigger analysis if status is 'uploaded'
+            if isinstance(item_data, dict) and item_data.get('status') == 'uploaded':
+                st.session_state.upload_cache[file_id]['status'] = 'analyzing'
+                triggered_count += 1
+        if triggered_count > 0:
+            st.toast(f"Triggered analysis for {triggered_count} thumbnail(s).", icon="🧠")
+            # No rerun here needed, the main loop will see 'analyzing' status and handle it
+        else:
+            st.toast("No thumbnails awaiting analysis.", icon="🤷")
 
 
 # ---------- Upload and Process Function ----------
-
 def upload_and_process(client: OpenAI):
-    st.header("Upload & Analyze Thumbnails")
-    st.info(
-        "Upload images, click '🧠 Analyze All Pending', then '✅ Add to Library' to save to the suggested category folder.")
+    # (Function logic is largely the same, uses updated analyze function)
+    st.header("Upload & Classify Thumbnails")
+    st.info("Upload images, click '🧠 Analyze All Pending', then '✅ Add to Library' to save to the suggested category folder.")
 
     if 'upload_cache' not in st.session_state:
         st.session_state.upload_cache = {}
@@ -448,50 +566,67 @@ def upload_and_process(client: OpenAI):
         key="file_uploader"
     )
 
+    # Process newly uploaded files
     if uploaded_files:
+        # new_files_added = False # Removed rerun based on this
         for uploaded_file in uploaded_files:
+            # Create a unique ID based on name and size
             file_id = f"{uploaded_file.name}_{uploaded_file.size}"
             if file_id not in st.session_state.upload_cache:
+                # new_files_added = True
                 try:
                     image_bytes = uploaded_file.getvalue()
+                    # Basic validation and conversion to JPEG bytes for consistency
                     display_image = Image.open(io.BytesIO(image_bytes))
-                    display_image.verify()
+                    display_image.verify() # Verify image data
+                    # Re-open after verify
                     display_image = Image.open(io.BytesIO(image_bytes))
 
+                    # Convert to RGB (for JPEG saving) and save to bytes buffer
                     img_byte_arr = io.BytesIO()
+                    # Ensure image is converted to RGB before saving as JPEG
                     if display_image.mode == 'RGBA' or display_image.mode == 'P':
-                        processed_image = display_image.convert('RGB')
+                         processed_image = display_image.convert('RGB')
                     else:
-                        processed_image = display_image
+                         processed_image = display_image
 
-                    processed_image.save(img_byte_arr, format='JPEG', quality=85)
+                    processed_image.save(img_byte_arr, format='JPEG', quality=85) # Use quality 85
                     processed_image_bytes = img_byte_arr.getvalue()
 
+                    # Store BOTH original (for display) and processed (for analysis/saving)
                     st.session_state.upload_cache[file_id] = {
                         'name': uploaded_file.name,
-                        'original_bytes': image_bytes,
-                        'processed_bytes': processed_image_bytes,
+                        'original_bytes': image_bytes,      # Keep original bytes for display
+                        'processed_bytes': processed_image_bytes, # Use processed for analysis/saving
                         'label': None,
                         'reason': "Awaiting analysis",
-                        'status': 'uploaded'
+                        'status': 'uploaded' # Initial status
                     }
                 except Exception as e:
                     st.error(f"Error processing {uploaded_file.name}: {e}. File skipped.")
+                    # Add error status to cache to prevent re-processing attempts
                     st.session_state.upload_cache[file_id] = {
                         'status': 'error',
                         'error_msg': str(e),
                         'name': uploaded_file.name
                     }
+        # Optional: Rerun immediately after processing uploads to show them instantly
+        # if new_files_added: st.rerun()
 
+
+    # Display and Process items from Cache
     if st.session_state.upload_cache:
         st.markdown("---")
+        # Control Buttons
         col1, col2 = st.columns(2)
         with col1:
+            # Check if any items have 'uploaded' status
             items_to_analyze = any(
                 isinstance(item, dict) and item.get('status') == 'uploaded'
                 for item in st.session_state.upload_cache.values()
             )
             analyze_all_disabled = not items_to_analyze or not client
+            # Use the callback for 'Analyze All'
             st.button(
                 "🧠 Analyze All Pending",
                 key="analyze_all",
@@ -502,51 +637,63 @@ def upload_and_process(client: OpenAI):
             )
 
         with col2:
+            # Button to clear the cache
             if st.button("Clear Uploads and Analyses", key="clear_uploads", use_container_width=True):
                 st.session_state.upload_cache = {}
-                st.rerun()
+                st.rerun() # Rerun to clear the display
 
         st.markdown("---")
 
-        num_columns = 4
+        # Thumbnail Grid
+        num_columns = 4 # Adjust number of columns
         cols = st.columns(num_columns)
         col_index = 0
 
+        # Iterate over a copy of keys to allow modification during iteration (if needed, though callbacks handle it now)
         for file_id in list(st.session_state.upload_cache.keys()):
-            item_data = st.session_state.upload_cache.get(file_id)
+            item_data = st.session_state.upload_cache.get(file_id) # Use .get for safety
 
+            # Skip if item_data is somehow invalid or removed
             if not isinstance(item_data, dict) or 'status' not in item_data:
                 continue
 
             with cols[col_index % num_columns]:
-                with st.container(border=False):
+                # Use st.container for grouping elements for each thumbnail
+                with st.container(border=False): # Use border=False if using CSS border
                     st.markdown('<div class="thumbnail-container">', unsafe_allow_html=True)
                     try:
                         if item_data['status'] == 'error':
-                            st.error(
-                                f"Error with {item_data.get('name', 'Unknown File')}: {item_data.get('error_msg', 'Unknown error')}")
+                            st.error(f"Error with {item_data.get('name', 'Unknown File')}: {item_data.get('error_msg', 'Unknown error')}")
                         else:
+                            # Display image using original bytes
                             st.image(
                                 item_data['original_bytes'],
                                 caption=f"{item_data.get('name', 'Unnamed Thumbnail')}",
                                 use_container_width=True
                             )
 
-                            analysis_placeholder = st.empty()
+                            analysis_placeholder = st.empty() # Placeholder for status/buttons
 
+                            # Handle different statuses
                             if item_data['status'] == 'uploaded':
                                 analysis_placeholder.info("Ready for analysis.")
                             elif item_data['status'] == 'analyzing':
+                                # This block runs when status is set by the analyze_all_callback
                                 with analysis_placeholder.container():
-                                    with st.spinner(f"Analyzing {item_data['name']}..."):
-                                        label, reason = analyze_and_classify_thumbnail(client,
-                                                                                       item_data['processed_bytes'])
-                                        if file_id in st.session_state.upload_cache:
+                                     with st.spinner(f"Analyzing {item_data['name']}..."):
+                                        # Perform analysis - Use processed bytes
+                                        # Use the *original* bytes for classification if processed might lose info? Test this.
+                                        # Let's stick to processed bytes for consistency with saving format assumption
+                                        label, reason = analyze_and_classify_thumbnail(client, item_data['processed_bytes'])
+                                        # Update cache entry - MUTATING session state here
+                                        if file_id in st.session_state.upload_cache: # Check if still exists
                                             st.session_state.upload_cache[file_id]['label'] = label
-                                            st.session_state.upload_cache[file_id]['reason'] = reason
+                                            st.session_state.upload_cache[file_id]['reason'] = reason # Store reason/status msg
                                             st.session_state.upload_cache[file_id]['status'] = 'analyzed'
+                                            # Rerun needed to update display from 'analyzing' to 'analyzed' state
                                             st.rerun()
                             elif item_data['status'] in ['analyzed', 'added']:
+                                # Display results and 'Add to Library' button
                                 with analysis_placeholder.container():
                                     st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
                                     label = item_data.get('label', 'Uncategorized')
@@ -557,7 +704,7 @@ def upload_and_process(client: OpenAI):
                                         is_added or
                                         label == "Uncategorized" or
                                         not label or
-                                        label == "Other / Unclear"
+                                        label == "Other / Unclear" # Also disable for Other/Unclear
                                     )
 
                                     st.button(
@@ -566,85 +713,86 @@ def upload_and_process(client: OpenAI):
                                         on_click=add_to_library_callback,
                                         args=(file_id, item_data['processed_bytes'], label, item_data['name']),
                                         disabled=add_button_disabled,
-                                        use_container_width=True,
-                                        help="Save this image to the suggested category folder." if not add_button_disabled else (
-                                            "Image already added" if is_added else "Cannot add Uncategorized or Other/Unclear images")
+                                        use_container_width=True, # Make button fill width
+                                        help="Save this image to the suggested category folder." if not add_button_disabled else ("Image already added" if is_added else "Cannot add Uncategorized or Other/Unclear images")
                                     )
                                     st.markdown('</div>', unsafe_allow_html=True)
 
                     except KeyError as e:
                         st.error(f"Missing data for an item: {e}. Try re-uploading.")
-                        if file_id in st.session_state.upload_cache:
-                            del st.session_state.upload_cache[file_id]
+                        if file_id in st.session_state.upload_cache: del st.session_state.upload_cache[file_id] # Clean up bad entry
                     except Exception as e:
                         st.error(f"Display error for {item_data.get('name', file_id)}: {e}")
                     finally:
-                        st.markdown('</div>', unsafe_allow_html=True)
+                         st.markdown('</div>', unsafe_allow_html=True) # Close container div
 
             col_index += 1
 
+    # Message if cache is empty and no files were uploaded in this run
     elif not uploaded_files:
-        st.markdown("<p style='text-align: center; font-style: italic;'>Upload some thumbnails to get started!</p>",
-                    unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; font-style: italic;'>Upload some thumbnails to get started!</p>", unsafe_allow_html=True)
 
 
 # ---------- Function to create Zip File from Single Folder ----------
-
 def create_zip_from_folder(category_name):
-    try:
-        sanitized_category = sanitize_foldername(category_name)
-        category_path = pathlib.Path(LIBRARY_DIR) / sanitized_category
-        zip_buffer = io.BytesIO()
-        added_files = 0
+    # (Function remains the same)
+    sanitized_category = sanitize_foldername(category_name)
+    category_path = pathlib.Path(LIBRARY_DIR) / sanitized_category
+    zip_buffer = io.BytesIO()
+    added_files = 0
 
-        if not category_path.is_dir():
-            return None
+    if not category_path.is_dir():
+        return None # Category folder doesn't exist
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for item in category_path.iterdir():
-                if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png',
-                                                             '.webp'] and not item.name.startswith('.'):
-                    try:
-                        zipf.write(item, arcname=item.name)
-                        added_files += 1
-                    except Exception as zip_err:
-                        st.warning(f"Zip error for {item.name} in {category_name}: {zip_err}")
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for item in category_path.iterdir():
+            # Ensure it's a file, has an image extension, and not hidden
+            if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp'] and not item.name.startswith('.'):
+                try:
+                    # Add file to the root of the zip archive
+                    zipf.write(item, arcname=item.name)
+                    added_files += 1
+                except Exception as zip_err:
+                    st.warning(f"Zip error for {item.name} in {category_name}: {zip_err}")
 
-        if added_files == 0:
-            return None
+    if added_files == 0:
+        return None # No valid image files found in the folder
 
-        zip_buffer.seek(0)
-        return zip_buffer
-    except Exception as e:
-        st.error(f"Error creating zip from folder: {e}")
-        return None
+    zip_buffer.seek(0) # Rewind buffer to the beginning
+    return zip_buffer
 
 
 # ---------- Library Explorer ----------
-
 def library_explorer():
+    # (Function remains largely the same, displays folders, includes delete)
     st.header("Thumbnail Library Explorer")
     st.markdown("Browse saved thumbnails by category folder. Delete images or download category Zips.")
 
+    # Initialize state variables if they don't exist
     if 'confirm_delete_path' not in st.session_state:
         st.session_state.confirm_delete_path = None
     if "selected_category_folder" not in st.session_state:
         st.session_state.selected_category_folder = None
 
+    # Get current categories from filesystem
     categories = get_categories_from_folders()
 
+    # --- Display Confirmation Dialog if an image is marked for deletion ---
+    # This check MUST happen before the main explorer view renders
     if st.session_state.confirm_delete_path:
-        display_delete_confirmation()
-        return
+        display_delete_confirmation() # Call the confirmation dialog function
+        # Stop further execution in this explorer view while confirming
+        return # IMPORTANT: Prevent rest of the function from running
 
+    # --- Main Explorer View ---
     if st.session_state.selected_category_folder is None:
+        # Category Selection Grid
         st.markdown("### Select a Category Folder to View")
         if not categories:
-            st.info(
-                "Your thumbnail library is currently empty. Add some images via the 'Upload & Analyze' tab or 'Generate Thumbnail' tab.")
+            st.info("Your thumbnail library is currently empty. Add some images via the 'Upload & Classify' tab or 'Generate Thumbnail' tab.")
             return
 
-        cols_per_row = 5
+        cols_per_row = 5 # Adjust number of columns for categories
         num_categories = len(categories)
         num_rows = (num_categories + cols_per_row - 1) // cols_per_row
 
@@ -654,47 +802,56 @@ def library_explorer():
                 idx = i * cols_per_row + j
                 if idx < num_categories:
                     cat_name = categories[idx]
+                    # Display category name on the button
                     if cols[j].button(cat_name, key=f"btn_lib_{cat_name}", use_container_width=True):
                         st.session_state.selected_category_folder = cat_name
-                        st.rerun()
+                        st.rerun() # Rerun to show the selected category's content
 
     else:
+        # Display Selected Category Content
         selected_category = st.session_state.selected_category_folder
         st.markdown(f"### Category Folder: **{selected_category}**")
 
+        # Top Bar: Back, Direct Upload, Download
+        # Adjust column widths: Make back button smaller, expander larger
         top_cols = st.columns([0.2, 0.5, 0.3])
 
-        with top_cols[0]:
-            if st.button("⬅️ Back", key="back_button", use_container_width=True,
-                         help="Go back to category list"):
+        with top_cols[0]: # Back Button
+            if st.button("⬅️ Back", key="back_button", use_container_width=True, help="Go back to category list"):
                 st.session_state.selected_category_folder = None
-                st.session_state.confirm_delete_path = None
+                st.session_state.confirm_delete_path = None # Ensure confirmation state is cleared when going back
                 st.rerun()
 
+        # Direct Upload Expander
         with top_cols[1]:
             with st.expander(f"⬆️ Add Image Directly to '{selected_category}'"):
                 direct_uploaded_file = st.file_uploader(
                     f"Upload image for '{selected_category}'",
                     type=["jpg", "jpeg", "png", "webp"],
                     key=f"direct_upload_{selected_category}",
-                    label_visibility="collapsed"
+                    label_visibility="collapsed" # Hide label to save space
                 )
                 if direct_uploaded_file:
+                    # Generate a unique ID for this upload instance
                     file_id = f"direct_{selected_category}_{direct_uploaded_file.name}_{direct_uploaded_file.size}"
 
+                    # Initialize session state for tracking if added
                     if f'direct_added_{file_id}' not in st.session_state:
                         st.session_state[f'direct_added_{file_id}'] = False
 
                     is_added = st.session_state[f'direct_added_{file_id}']
 
+                    # Display uploaded image preview
                     st.image(direct_uploaded_file, width=150)
 
                     try:
+                        # Process the uploaded image (convert to JPEG bytes for consistency)
                         img_bytes_direct = direct_uploaded_file.getvalue()
                         img_direct = Image.open(io.BytesIO(img_bytes_direct))
                         img_direct.verify()
                         img_direct = Image.open(io.BytesIO(img_bytes_direct))
 
+                        # Convert to RGB before saving as JPEG if needed
                         if img_direct.mode == 'RGBA' or img_direct.mode == 'P':
                             img_direct = img_direct.convert("RGB")
 
@@ -702,20 +859,22 @@ def library_explorer():
                         img_direct.save(img_byte_arr_direct, format='JPEG', quality=85)
                         processed_bytes_direct = img_byte_arr_direct.getvalue()
 
+                        # Add button (disabled if already added)
                         st.button(
                             f"⬆️ Add This Image" if not is_added else "✔️ Added",
                             key=f"btn_direct_add_{file_id}",
                             on_click=add_direct_to_library_callback,
-                            args=(file_id, processed_bytes_direct, selected_category,
-                                  direct_uploaded_file.name),
+                            args=(file_id, processed_bytes_direct, selected_category, direct_uploaded_file.name),
                             disabled=is_added,
                             use_container_width=True
                         )
                     except Exception as e:
                         st.error(f"Failed to process direct upload: {e}")
 
+        # Get images for the selected category
         image_files = get_images_in_category(selected_category)
 
+        # Download Button (only if there are images)
         if image_files:
             with top_cols[2]:
                 zip_buffer = create_zip_from_folder(selected_category)
@@ -730,39 +889,501 @@ def library_explorer():
                         help=f"Download all images in '{selected_category}' as a zip file."
                     )
                 else:
-                    st.button(f"⬇️ Download ({len(image_files)})", disabled=True,
-                              use_container_width=True, help="No valid images to download.")
+                    # Show disabled placeholder if zipping failed or folder empty after filtering
+                     st.button(f"⬇️ Download ({len(image_files)})", disabled=True, use_container_width=True, help="No valid images to download.")
+
+
+            # Thumbnail Display Grid (with Delete Button)
+            st.markdown("---")
+            cols_per_row_thumbs = 5 # More columns for thumbnails
+            thumb_cols = st.columns(cols_per_row_thumbs)
+            col_idx = 0
+            for image_path in image_files:
+                with thumb_cols[col_idx % cols_per_row_thumbs]:
+                    with st.container(border=False):
+                        # Use the db-thumbnail-container class from CSS
+                        st.markdown('<div class="db-thumbnail-container">', unsafe_allow_html=True)
+                        try:
+                            image_path_str = str(image_path)
+                            # Display the image
+                            st.image(image_path_str, caption=f"{image_path.name}", use_container_width=True)
+
+                            # Container for the delete button
+                            st.markdown('<div class="delete-button-container">', unsafe_allow_html=True)
+                            # Unique key for delete button using path and mtime
+                            mtime = image_path.stat().st_mtime
+                            del_key = f"del_{image_path.name}_{mtime}"
+
+                            # Delete button - sets state to trigger confirmation
+                            if st.button("🗑️", key=del_key, help="Delete this image"):
+                                st.session_state.confirm_delete_path = image_path_str
+                                st.rerun() # Rerun to show the confirmation dialog
+
+                            st.markdown('</div>', unsafe_allow_html=True) # Close delete button container
+
+                        except Exception as img_err:
+                            st.warning(f"Could not load: {image_path.name} ({img_err})")
+                        finally:
+                            st.markdown('</div>', unsafe_allow_html=True) # Close db-thumbnail-container
+                col_idx += 1
+
+        # Message if category folder is empty (and no direct upload happened)
+        # Only show if not currently interacting with direct upload file picker
+        elif not image_files and not direct_uploaded_file: # Check if image_files is empty AND no file is actively uploaded
+             st.info(f"No thumbnails found in the folder: '{selected_category}'. You can add images directly using the expander above.")
+
+
+# ---------- Delete Confirmation Dialog Function ----------
+def display_delete_confirmation():
+    """ Displays the confirmation dialog for deleting an image. """
+    # This function assumes it's only called when st.session_state.confirm_delete_path is set
+    file_to_delete = st.session_state.confirm_delete_path
+    if not file_to_delete: return # Should not happen based on calling logic, but safe check
+
+    # Use a modal dialog or a prominent warning box
+    # Using st.warning for simplicity
+    with st.warning(f"**Confirm Deletion:** Are you sure you want to permanently delete `{os.path.basename(file_to_delete)}`?"):
+        # Arrange buttons horizontally
+        col1, col2, col3 = st.columns([1.5, 1, 5]) # Adjust spacing as needed
+        with col1:
+            if st.button("🔥 Confirm Delete", key="confirm_delete_yes", type="primary"):
+                delete_success = delete_image_file(file_to_delete)
+                st.session_state.confirm_delete_path = None # Clear the state regardless of success
+                st.rerun() # Refresh the library view
+        with col2:
+             if st.button("🚫 Cancel", key="confirm_delete_cancel"):
+                st.session_state.confirm_delete_path = None # Clear the state
+                st.rerun() # Refresh the view to hide dialog
+
+
+# ---------- NEW: Direct Thumbnail Generation UI and Logic ----------
+def thumbnail_generator_direct_ui(client: OpenAI):
+    """ Renders the UI for generating thumbnails directly from a prompt. """
+    st.header("Generate Thumbnail Directly")
+    st.markdown("Describe the thumbnail you want, select optional reference style categories (from standard definitions), and generate!")
+
+    if not client:
+        st.error("❌ OpenAI client not initialized. Please provide your API key in the sidebar.")
+        return
+
+    # --- Input Fields ---
+    prompt_text = st.text_area(
+        "**Thumbnail Content Prompt:**",
+        height=150,
+        key="generator_direct_prompt_text", # Unique key
+        placeholder="e.g., 'A futuristic cityscape at sunset with a glowing neon sign saying SUBSCRIBE', 'Close up of a golden retriever puppy looking curious', 'Split screen showing messy vs tidy desk'"
+    )
+
+    # Use descriptions from STANDARD_CATEGORIES_WITH_DESC for style hints
+    category_map = {cat['name']: cat['description'] for cat in STANDARD_CATEGORIES_WITH_DESC}
+    # Filter out "Other / Unclear" as a style choice maybe? Or keep it? Let's keep it for now.
+    style_options = STANDARD_CATEGORIES # Use the standard list as potential styles
+
+    selected_style_categories = st.multiselect(
+        "**Reference Style Categories (Optional - Standard Definitions):**",
+        options=style_options,
+        key="generator_direct_style_categories", # Unique key
+        help="Select one or more *standard* categories to guide the visual style (e.g., 'Face-Focused', 'High Contrast'). The AI will try to incorporate these styles based on their general descriptions."
+    )
+
+    # --- Generation Button ---
+    if st.button("✨ Generate Directly", key="generate_thumb_direct", disabled=not prompt_text):
+        # Clear previous generation state before starting anew
+        # Using shared state keys assumes only one generator is active/displayed at a time
+        st.session_state.generated_image_b64 = None
+        st.session_state.generation_prompt_used = None
+        st.session_state.generated_image_saved = False
+        st.session_state.generation_error = None # Clear previous errors
+
+        with st.spinner("Generating thumbnail with DALL-E 3... This may take a moment."):
+            try:
+                # --- Construct the Full Prompt ---
+                # Base prompt requesting a YouTube thumbnail format
+                full_prompt = f"Create a hyper-realistic YouTube thumbnail image (aspect ratio 16:9) depicting: {prompt_text}."
+
+                # Add style guidance if categories are selected
+                if selected_style_categories:
+                    style_hints = []
+                    for cat_name in selected_style_categories:
+                        if cat_name in category_map:
+                            # Add specific descriptions as style guidance
+                            style_hints.append(f"- Style emphasis based on '{cat_name}': {category_map[cat_name]}")
+                        else:
+                            style_hints.append(f"- Style emphasis: {cat_name}") # Fallback to name if no desc found
+
+                    if style_hints:
+                        full_prompt += "\n\nIncorporate the following stylistic elements if relevant to the main subject, based on standard definitions:\n" + "\n".join(style_hints)
+                else:
+                    # Generic guidance if no styles selected
+                    full_prompt += "\n\nUse a visually striking and engaging style suitable for a high-clickthrough YouTube thumbnail."
+
+                # Add standard negative prompts or quality boosters if desired
+                full_prompt += "\n\nEnsure the image is high quality, clear, and follows the main prompt accurately. Avoid overly complex or unreadable text unless specifically requested."
+
+
+                st.caption(f"Sending prompt to DALL-E 3...") # Simplified caption
+                # print(f"DALL-E Prompt (Direct): {full_prompt}") # Print to console for debugging
+
+                # --- Call OpenAI Image Generation API (DALL-E 3) ---
+                response = client.images.generate(
+                    model="dall-e-3",
+                    prompt=full_prompt,
+                    size="1792x1024", # Landscape, close to 16:9
+                    quality="hd",     # Use "hd" for better quality/detail
+                    n=1,              # Generate one image
+                    response_format="b64_json" # Get base64 encoded image data directly
+                )
+
+                # --- Process Response ---
+                if response.data and response.data[0].b64_json:
+                    b64_data = response.data[0].b64_json
+                    # Store generated data in session state to persist across reruns (for saving)
+                    st.session_state.generated_image_b64 = b64_data
+                    # Store the user's *original* prompt text for filename generation
+                    st.session_state.generation_prompt_used = prompt_text
+                    st.session_state.generated_image_saved = False # Reset saved flag for the new image
+                    st.session_state.generation_error = None # Clear error on success
+
+                    st.rerun() # Rerun to display the generated image and save options
+
+                else:
+                    st.error("❌ Image generation succeeded but no image data received.")
+                    st.session_state.generation_error = "API returned success but no image data."
+
+
+            except Exception as e:
+                error_message = f"❌ Thumbnail generation failed: {e}"
+                st.error(error_message)
+                if hasattr(e, 'response') and e.response:
+                     st.error(f"API Response: {e.response.text}") # Show more details if available
+                if "safety system" in str(e).lower():
+                     st.warning("The prompt may have been blocked by the safety system. Please revise your prompt.")
+                     error_message += " (Safety System Block)"
+                # Clear any potentially stale generated image data on failure
+                st.session_state.generated_image_b64 = None
+                st.session_state.generation_prompt_used = None
+                st.session_state.generation_error = error_message # Store error message
+
+
+    # --- Display Generated Image and Save Options (if image exists in state) ---
+    # This part is now shared and called by both generator UIs
+    display_generated_image_section()
+
+
+# ---------- NEW: Generate by Category Style UI ----------
+def generate_by_category_style_ui(client: OpenAI):
+    """ Renders the UI for generating thumbnails based on existing category style. """
+    st.header("Generate by Category Style")
+    st.markdown("Select an existing category from your library. Describe the *content* you want. The AI will analyze the category's style and combine it with your content description.")
+
+    if not client:
+        st.error("❌ OpenAI client not initialized. Please provide your API key in the sidebar.")
+        return
+
+    # --- Input Fields ---
+    available_categories = get_categories_from_folders()
+    # Filter out categories not suitable for style reference (optional, but good practice)
+    style_ref_categories = [cat for cat in available_categories if cat not in ["uncategorized", "Other / Unclear"]] # Exclude generic ones
+
+    if not style_ref_categories:
+        st.warning("You need at least one category with saved images in your library to use this feature. Please add images via 'Upload & Classify' or the 'Library Explorer'.")
+        return
+
+    selected_category = st.selectbox(
+        "**Select Reference Category:**",
+        options=style_ref_categories,
+        key="generator_style_ref_category", # Unique key
+        help="Choose a category from your library. The AI will analyze its visual style."
+    )
+
+    content_prompt = st.text_area(
+        "**Thumbnail Content Prompt:**",
+        height=150,
+        key="generator_style_content_prompt", # Unique key
+        placeholder="Describe the main subject or scene, e.g., 'Excited person reacting to a graph showing upward trend', 'Stack of pancakes with syrup dripping', 'Code editor showing Python function'"
+    )
+
+    # --- Generation Button ---
+    generate_button_disabled = not selected_category or not content_prompt
+    if st.button("🎨 Generate with Category Style", key="generate_thumb_style", disabled=generate_button_disabled):
+        # Clear previous generation state
+        st.session_state.generated_image_b64 = None
+        st.session_state.generation_prompt_used = None
+        st.session_state.generated_image_saved = False
+        st.session_state.generation_error = None # Clear previous errors
+
+        # 1. Analyze Style
+        style_desc = None
+        analysis_status_msg = ""
+        with st.spinner(f"Analyzing style of '{selected_category}' category..."):
+            style_desc, analysis_status_msg = analyze_category_style(client, selected_category)
+
+        if not style_desc:
+            st.error(f"Failed to analyze category style: {analysis_status_msg}")
+            st.session_state.generation_error = f"Style analysis failed: {analysis_status_msg}"
+            # No rerun here, just show error and stop
+            return # Stop generation process
+        else:
+            st.success(f"Style analysis complete for '{selected_category}'.")
+            # Optionally display the derived style description for transparency
+            with st.expander("Derived Style Description (for AI guidance)"):
+                 st.caption(style_desc)
+
+        # 2. Generate Image using analyzed style + content prompt
+        with st.spinner("Generating thumbnail with DALL-E 3 using analyzed style..."):
+            try:
+                 # --- Construct the Full Prompt ---
+                full_prompt = (
+                    f"Create a YouTube thumbnail image (aspect ratio 16:9) depicting: {content_prompt}.\n\n"
+                    f"IMPORTANT: The visual style MUST strongly adhere to the following characteristics derived from analyzing similar successful thumbnails:\n"
+                    f"--- Style Description Start ---\n{style_desc}\n--- Style Description End ---\n\n"
+                    f"Ensure the image is high quality, clear, integrates the content naturally within the described style, and is suitable for a high-clickthrough YouTube thumbnail. Avoid text unless part of the content prompt."
+                 )
+
+                st.caption("Sending combined prompt to DALL-E 3...")
+                # print(f"DALL-E Prompt (Styled): {full_prompt}") # Debugging
+
+                # --- Call DALL-E API ---
+                response = client.images.generate(
+                    model="dall-e-3",
+                    prompt=full_prompt,
+                    size="1792x1024",
+                    quality="hd",
+                    n=1,
+                    response_format="b64_json"
+                )
+
+                # --- Process Response ---
+                if response.data and response.data[0].b64_json:
+                    b64_data = response.data[0].b64_json
+                    st.session_state.generated_image_b64 = b64_data
+                    # Use content prompt for filename hint
+                    st.session_state.generation_prompt_used = content_prompt
+                    st.session_state.generated_image_saved = False
+                    st.session_state.generation_error = None
+                    st.rerun() # Rerun to display result
+                else:
+                    st.error("❌ Image generation succeeded but no image data received.")
+                    st.session_state.generation_error = "API returned success but no image data."
+
+            except Exception as e:
+                error_message = f"❌ Thumbnail generation failed: {e}"
+                st.error(error_message)
+                if hasattr(e, 'response') and e.response:
+                     st.error(f"API Response: {e.response.text}")
+                if "safety system" in str(e).lower():
+                     st.warning("The prompt may have been blocked by the safety system. Please revise your prompt or check the analyzed style description.")
+                     error_message += " (Safety System Block)"
+                st.session_state.generated_image_b64 = None
+                st.session_state.generation_prompt_used = None
+                st.session_state.generation_error = error_message # Store error
+
+    # --- Display Generated Image and Save Options ---
+    # This part is now shared and called by both generator UIs
+    display_generated_image_section()
+
+
+# ---------- NEW: Shared Function to Display Generated Image & Save Options --------
+def display_generated_image_section():
+    """ Displays the generated image (if available in state) and options to save it. """
+    if 'generated_image_b64' in st.session_state and st.session_state.generated_image_b64:
+        st.markdown("---")
+        st.subheader("Generated Thumbnail Result")
+        # Check save status *before* displaying controls that might trigger a rerun
+        is_saved = st.session_state.get('generated_image_saved', False)
+
+        st.markdown('<div class="generated-image-container">', unsafe_allow_html=True) # Add class for styling
+
+        try:
+            # Decode base64 image data
+            generated_image_bytes = base64.b64decode(st.session_state.generated_image_b64)
+            st.image(generated_image_bytes, caption="Generated Image Preview", use_container_width=True)
+
+            st.markdown("---")
+            st.markdown("**Save Generated Thumbnail to Library:**")
+
+            # Allow user to choose which category to save to
+            # Get current list of folders each time to ensure it's up-to-date
+            current_folders = get_categories_from_folders()
+            # Filter out generic/unwanted categories if needed
+            savable_categories = [cat for cat in current_folders if cat not in ["uncategorized", "other_unclear"]] # Should not save to these
+
+            # Try to pre-select the category used for style generation if applicable
+            # This requires knowing which generator was used. We don't store that explicitly,
+            # but we can check if 'generator_style_ref_category' was set in the *last* run. Risky.
+            # Safer to just provide the list. Let user choose.
+            default_index = 0
+            if not savable_categories:
+                st.warning("No suitable library categories found to save the image. Please create a category folder first (e.g., via Upload & Classify).")
+                save_category = None
+                save_button_disabled = True
+            else:
+                save_category = st.selectbox(
+                    "Choose destination category:",
+                    options=savable_categories, # Use existing folders as destinations
+                    key="save_gen_category_select", # Shared key is okay here
+                    index=default_index # Default to first if available
+                )
+                save_button_disabled = not save_category or is_saved
+
+            # Create a filename based on the prompt (sanitized)
+            prompt_part_for_filename = re.sub(r'\W+', '_', st.session_state.get('generation_prompt_used', 'generated_image'))[:40].strip('_')
+            if not prompt_part_for_filename: prompt_part_for_filename = "generated"
+            # DALL-E b64 is typically PNG
+            generated_filename = f"{prompt_part_for_filename}.png"
+
+            # Unique file ID for the generated image instance (helps callback distinguish)
+            # Using a simple timestamp + prompt hint ID suffices as only one generated image is active
+            gen_file_id = f"gen_{prompt_part_for_filename[:10]}_{int(time.time())}"
+
+
+            st.button(
+                "✅ Save to Selected Category" if not is_saved else "✔️ Saved",
+                key=f"btn_save_gen_{gen_file_id}", # Needs to be unique enough per generation instance
+                on_click=add_to_library_callback, # Reuse the same callback
+                args=(
+                    gen_file_id, # Pass the unique ID
+                    generated_image_bytes, # Pass the raw bytes
+                    save_category,
+                    generated_filename
+                ),
+                disabled=save_button_disabled,
+                use_container_width=True, # Make button fill width
+                help="Save this generated image to the chosen category folder." if not save_button_disabled else ("Image already saved" if is_saved else "Please select a valid category")
+            )
+
+        except Exception as display_err:
+            st.error(f"Error displaying or preparing generated image for saving: {display_err}")
+            # Clean up state if display fails badly
+            st.session_state.generated_image_b64 = None
+            st.session_state.generation_prompt_used = None
+            st.session_state.generated_image_saved = False
+        finally:
+             st.markdown('</div>', unsafe_allow_html=True) # Close generated-image-container
+    elif st.session_state.get("generation_error"):
+        # If there was a generation error stored, display it prominently here
+        # (This handles cases where generation failed before reaching the display stage)
+        st.markdown("---")
+        st.error(f"Previous generation attempt failed: {st.session_state.generation_error}")
+
+
+# ---------- Main App ----------
+def main():
+    ensure_library_dir()
+    # Create predefined folders on startup using the names list
+    create_predefined_category_folders(STANDARD_CATEGORIES)
+
+    # Initialize Session State Keys robustly if they don't exist
+    keys_to_init = {
+        'selected_category_folder': None,
+        'upload_cache': {},
+        'confirm_delete_path': None,
+        'generated_image_b64': None,
+        'generation_prompt_used': None, # Stores the text prompt used for the LAST generation
+        'generated_image_saved': False, # Tracks if the currently displayed generated image has been saved
+        'generation_error': None,       # Stores error message from the last generation attempt
+        'nav_menu': None                # Stores the current navigation selection
+        # Add keys for new generator UI elements if needed for complex state saving,
+        # but simple reruns often handle updates correctly for selectboxes/textareas
+    }
+    for key, default_value in keys_to_init.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+
+    # --- Sidebar Setup ---
+    with st.sidebar:
+        # Simple title/logo placeholder
+        st.markdown('<div style="text-align: center; padding: 10px;">🖼️</div>', unsafe_allow_html=True)
+        st.markdown('<h2 style="text-align: center;">Thumbnail Toolkit</h2>', unsafe_allow_html=True)
+        st.markdown("Analyze, organize, and generate YouTube thumbnails.", unsafe_allow_html=True)
+        st.markdown("---")
+
+        # OpenAI Client Setup (Crucial for Analysis & Generation)
+        client = setup_openai_client()
+        if not client:
+             st.warning("OpenAI API key needed for Analysis and Generation features.", icon="🔑")
+
+        # Navigation Menu
+        menu_options = ["Upload & Classify", "Generate Directly", "Generate by Category Style", "Library Explorer"] # Added new option
+        # Check if 'nav_menu' exists and is valid, otherwise default
+        current_selection = st.session_state.get("nav_menu", menu_options[0])
+        if current_selection not in menu_options:
+            current_selection = menu_options[0] # Default to first option if invalid state
+
+        menu = st.radio(
+            "Navigation",
+            menu_options,
+            key="nav_menu", # Let Streamlit manage state persistence via key
+            index=menu_options.index(current_selection), # Set index based on current state
+            label_visibility="collapsed" # Hide the label "Navigation"
+            )
+        st.markdown("---")
+
+        # Library Info & Download All
+        st.info(f"Library stored in:\n`./{LIBRARY_DIR}`")
+        try:
+            zip_buffer, file_count = create_zip_of_library()
+            if zip_buffer and file_count > 0:
+                st.download_button(
+                    label=f"⬇️ Download All ({file_count} images)",
+                    data=zip_buffer,
+                    file_name="thumbnail_library_archive.zip",
+                    mime="application/zip",
+                    key="download_all_library",
+                    use_container_width=True,
+                    help="Download all categories and images as a single zip file."
+                )
+            else:
+                st.button("⬇️ Download All (Empty)", disabled=True, use_container_width=True, help="Library is empty or contains no images.")
+        except Exception as zip_all_err:
+             st.error(f"Error creating library zip: {zip_all_err}")
+             st.button("⬇️ Download All (Error)", disabled=True, use_container_width=True)
+
 
         st.markdown("---")
-        cols_per_row_thumbs = 5
-        thumb_cols = st.columns(cols_per_row_thumbs)
-        col_idx = 0
-        for image_path in image_files:
-            with thumb_cols[col_idx % cols_per_row_thumbs]:
-                with st.container(border=False):
-                    st.markdown('<div class="db-thumbnail-container">', unsafe_allow_html=True)
-                    try:
-                        image_path_str = str(image_path)
-                        st.image(image_path_str, caption=f"{image_path.name}",
-                                 use_container_width=True)
 
-                        st.markdown('<div class="delete-button-container">',
-                                    unsafe_allow_html=True)
-                        mtime = image_path.stat().st_mtime
-                        del_key = f"del_{image_path.name}_{mtime}"
+        # Display standard categories list in sidebar
+        with st.expander("View Standard Categories & Descriptions"):
+            for cat in STANDARD_CATEGORIES_WITH_DESC:
+                 # Don't list the fallback category explicitly here unless needed
+                 if cat['name'] != "Other / Unclear":
+                     st.markdown(f"**{cat['name']}**: _{cat['description']}_")
 
-                        if st.button("🗑️", key=del_key, help="Delete this image"):
-                            st.session_state.confirm_delete_path = image_path_str
-                            st.rerun()
 
-                        st.markdown('</div>', unsafe_allow_html=True)
+    # --- Main Content Area ---
 
-                    except Exception as img_err:
-                        st.warning(f"Could not load: {image_path.name} ({img_err})")
-                    finally:
-                        st.markdown('</div>', unsafe_allow_html=True)
-            col_idx += 1
+    # Handle delete confirmation dialog first if active.
+    # This prevents other UI elements from rendering and interfering.
+    if st.session_state.confirm_delete_path:
+        display_delete_confirmation()
+    else:
+        # Clear generation state if navigating away from a generator tab
+        # This prevents a previously generated image showing up when you switch tabs
+        # NOTE: This check should happen *before* rendering the content of the new tab
+        active_generator_tabs = ["Generate Directly", "Generate by Category Style"]
+        previous_menu = st.session_state.get('_previous_nav_menu', None) # Need to track previous menu selection
+        if previous_menu in active_generator_tabs and menu not in active_generator_tabs:
+             if st.session_state.get('generated_image_b64') is not None:
+                # print("Navigating away from generator, clearing state.") # Debug
+                st.session_state.generated_image_b64 = None
+                st.session_state.generation_prompt_used = None
+                st.session_state.generated_image_saved = False
+                st.session_state.generation_error = None
+        # Update previous menu state *after* the check
+        st.session_state['_previous_nav_menu'] = menu
 
-        elif not direct_uploaded_file or not st.session_state.get(
-    f'direct_added_direct_{selected_category}_{direct_uploaded_file.name}_{direct_uploaded_file.size}',
-    False):
+
+        # Render the selected page based on the menu
+        if menu == "Upload & Classify":
+            upload_and_process(client) # Pass the client object
+        elif menu == "Generate Directly":
+            thumbnail_generator_direct_ui(client) # Pass the client object
+        elif menu == "Generate by Category Style":
+            generate_by_category_style_ui(client) # Pass the client object
+        elif menu == "Library Explorer":
+            library_explorer()
+
+
+if __name__ == "__main__":
+    main()
