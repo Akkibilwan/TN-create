@@ -1,0 +1,6 @@
+streamlit
+Pillow
+openai
+python-dotenv
+pathlib
+requests
