@@ -763,7 +763,6 @@ def library_explorer():
                         st.markdown('</div>', unsafe_allow_html=True)
             col_idx += 1
 
-        elif not direct_uploaded_file or (direct_uploaded_file and not st.session_state.get(
-                f'direct_added_direct_{selected_category}_{direct_uploaded_file.name}_{direct_uploaded_file.size}',
-                False)):
-            st.info(f"No thumbnails found in the folder: '{selected_category}'. You can add images directly using the expander above.")
+        elif not direct_uploaded_file or not st.session_state.get(
+    f'direct_added_direct_{selected_category}_{direct_uploaded_file.name}_{direct_uploaded_file.size}',
+    False):
