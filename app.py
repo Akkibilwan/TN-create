@@ -570,6 +570,7 @@ def upload_and_process(client: OpenAI):
         cache_keys = list(st.session_state.upload_cache.keys())
 
         for file_id in cache_keys:
+            # Retrieve item safely, might have been deleted by "Clear" button
             item_data = st.session_state.upload_cache.get(file_id)
             if not isinstance(item_data, dict) or 'status' not in item_data: continue
 
@@ -591,7 +592,8 @@ def upload_and_process(client: OpenAI):
                                 with st.spinner(f"Analyzing {item_data['name']}..."):
                                     # Use original bytes for analysis
                                     label, reason, layout, elements = analyze_classify_and_describe_elements(client, item_data['original_bytes'])
-                                    if file_id in st.session_state.upload_cache: # Check if item still exists
+                                    # Check item still exists before updating state (might be cleared during analysis)
+                                    if file_id in st.session_state.upload_cache:
                                         st.session_state.upload_cache[file_id].update({
                                             'label': label, 'reason': reason, 'layout': layout,
                                             'elements': elements or [], 'status': 'analyzed'
@@ -609,20 +611,22 @@ def upload_and_process(client: OpenAI):
                                     any_elements_available = True
                                     for i, desc in enumerate(elements):
                                         element_key = f"elem_{file_id}_{i}"
-                                        # Use session state to manage checkbox state persistently
-                                        is_selected = st.checkbox(
+                                        # Ensure checkbox state reflects session state
+                                        is_selected_in_state = element_key in st.session_state.selected_elements
+                                        is_selected_interaction = st.checkbox(
                                             f"{desc}",
-                                            value=(element_key in st.session_state.selected_elements), # Set initial value from state
+                                            value=is_selected_in_state, # Set initial value from state
                                             key=element_key,
-                                            help=f"Select this element: {desc}",
-                                            # Use CSS class for styling checkbox label if needed
-                                            #label_markdown_unsafe=f'<span class="element-checkbox">{desc}</span>'
+                                            help=f"Select element: {desc}"
+                                            # label_markdown_unsafe=f'<span class="element-checkbox">{desc}</span>' # Optional CSS styling
                                         )
-                                        # Update selected_elements state based on checkbox interaction
-                                        if is_selected:
+                                        # Update selected_elements state based on interaction
+                                        if is_selected_interaction and not is_selected_in_state:
                                             st.session_state.selected_elements[element_key] = desc
-                                        elif element_key in st.session_state.selected_elements:
+                                            # No automatic rerun on checkbox click needed if button triggers action
+                                        elif not is_selected_interaction and is_selected_in_state:
                                             del st.session_state.selected_elements[element_key]
+                                            # No automatic rerun needed here either
                                 else:
                                     st.caption("Elements: None described")
                 except KeyError as e:
@@ -630,7 +634,8 @@ def upload_and_process(client: OpenAI):
                 except Exception as e:
                     st.error(f"Display error for {item_data.get('name', file_id)}: {e}")
                 finally:
-                    st.markdown('</div>', unsafe_allow_html=True) # Close container div
+                    # Ensure container div is closed even if errors occur
+                    st.markdown('</div>', unsafe_allow_html=True)
             col_index += 1
 
         # --- Place the Generate Button ---
@@ -642,10 +647,12 @@ def upload_and_process(client: OpenAI):
         with generate_button_placeholder.container():
             st.markdown("---")
             if st.button(button_text, key="generate_with_elements_button", disabled=generate_disabled, use_container_width=True):
+                # Clear previous generation results first
                 st.session_state.generated_image_b64 = None
                 st.session_state.generation_prompt_used = None
                 st.session_state.generated_image_saved = False
                 st.session_state.generation_error = None
+
                 with st.spinner("Generating thumbnail using selected elements..."):
                     try:
                         element_list_str = "\n".join([f"- {desc}" for desc in selected_element_descriptions])
@@ -681,7 +688,7 @@ def upload_and_process(client: OpenAI):
                         if hasattr(e, 'response') and e.response: st.error(f"API Response: {e.response.text}")
                         if "safety system" in str(e).lower(): st.warning("Prompt possibly blocked by safety system.")
                         st.session_state.generation_error = error_message
-                st.rerun() # Rerun to show results/errors in the display section below
+                st.rerun() # Rerun AFTER button logic to show results/errors in the display section
 
     elif not uploaded_files:
         st.markdown("<p style='text-align: center; font-style: italic;'>Upload thumbnails to analyze elements!</p>", unsafe_allow_html=True)
@@ -844,76 +851,170 @@ def thumbnail_generator_direct_ui(client: OpenAI):
                 st.session_state.generation_error = error_message
         st.rerun() # Rerun to show result/error
 
-    display_generated_image_section() # Shared display
+    # Display Generated Image Section (Shared Function)
+    st.markdown("---") # Add separator before results
+    st.header("Generation Result")
+    display_generated_image_section()
 
-# ---------- Generate by Category Style UI ----------
+# ---------- Generate by Category Style UI (MODIFIED) ----------
 def generate_by_category_style_ui(client: OpenAI):
+    """ Renders the UI for generating thumbnails based on existing category style. """
     st.header("Generate by Category Style")
-    st.markdown("Select library category, describe content. AI analyzes category style & combines.")
-    if not client: st.error("❌ OpenAI client needed. Provide API key in sidebar."); return
+    st.markdown("Select an existing category. Describe the *content*. The AI will analyze the category's style, show you the final prompt, and then generate.") # Modified description
 
+    if not client:
+        st.error("❌ OpenAI client not initialized. Please provide your API key in the sidebar.")
+        return
+
+    # --- Input Fields ---
     available_categories = get_categories_from_folders()
-    style_ref_categories = [cat for cat in available_categories if cat not in ["uncategorized", "Other / Unclear"]]
-    if not style_ref_categories: st.warning("Need categories with images in library first."); return
+    style_ref_categories = [cat for cat in available_categories if cat not in ["uncategorized", "Other / Unclear"]] # Exclude generic ones
 
-    selected_category = st.selectbox("**Select Reference Category:**", options=style_ref_categories, key="generator_style_ref_category", help="AI will analyze this category's style.")
-    content_prompt = st.text_area("**Thumbnail Content Prompt:**", height=150, key="generator_style_content_prompt", placeholder="Describe main subject/scene...")
+    if not style_ref_categories:
+        st.warning("You need categories with saved images in your library first.")
+        return
 
-    generate_disabled = not selected_category or not content_prompt
-    if st.button("🎨 Generate with Category Style", key="generate_thumb_style", disabled=generate_disabled):
-        st.session_state.generated_image_b64 = None; st.session_state.generation_prompt_used = None
-        st.session_state.generated_image_saved = False; st.session_state.generation_error = None
-        style_desc, analysis_msg = None, ""
-        with st.spinner(f"Analyzing style of '{selected_category}'..."):
-            style_desc, analysis_msg = analyze_category_style(client, selected_category)
+    selected_category = st.selectbox(
+        "**Select Reference Category:**",
+        options=style_ref_categories,
+        key="generator_style_ref_category",
+        help="Choose a category from your library. The AI will analyze its visual style."
+    )
 
-        if not style_desc:
-            st.error(f"Failed style analysis: {analysis_msg}")
-            st.session_state.generation_error = f"Style analysis failed: {analysis_msg}"
-            st.rerun(); return # Stop and show error via rerun
+    content_prompt = st.text_area(
+        "**Thumbnail Content Prompt:**",
+        height=150,
+        key="generator_style_content_prompt",
+        placeholder="Describe the main subject or scene..."
+    )
 
-        st.success(f"Style analysis complete for '{selected_category}'.")
-        with st.expander("Derived Style Description (for AI)"): st.caption(style_desc)
+    # Placeholder for the prompt display and generation button
+    action_placeholder = st.empty()
 
-        with st.spinner("Generating thumbnail using analyzed style..."):
-            try:
+    # --- Interaction Logic ---
+    # Use session state to manage the flow: analyze -> show prompt -> generate
+    # Initialize state keys if they don't exist (handled in main, but good practice)
+    if 'style_analysis_done' not in st.session_state: st.session_state.style_analysis_done = False
+    if 'style_analysis_desc' not in st.session_state: st.session_state.style_analysis_desc = None
+    if 'style_analysis_error' not in st.session_state: st.session_state.style_analysis_error = None
+    if 'final_prompt_for_style_gen' not in st.session_state: st.session_state.final_prompt_for_style_gen = None
+
+    analyze_button_disabled = not selected_category or not content_prompt
+
+    with action_placeholder.container():
+        # Button to initiate analysis and prompt preparation
+        if st.button("1. Analyze Style & Prepare Prompt", key="analyze_style_button", disabled=analyze_button_disabled):
+            # Reset relevant state before starting analysis
+            st.session_state.style_analysis_done = False
+            st.session_state.style_analysis_desc = None
+            st.session_state.style_analysis_error = None
+            st.session_state.final_prompt_for_style_gen = None
+            st.session_state.generated_image_b64 = None # Clear previous gen results
+            st.session_state.generation_error = None
+
+            style_desc, analysis_msg = None, ""
+            with st.spinner(f"Analyzing style of '{selected_category}'..."):
+                style_desc, analysis_msg = analyze_category_style(client, selected_category)
+
+            if not style_desc:
+                st.error(f"Failed style analysis: {analysis_msg}")
+                st.session_state.style_analysis_error = f"Style analysis failed: {analysis_msg}"
+                st.session_state.style_analysis_done = False # Mark as not completed
+            else:
+                st.success(f"Style analysis complete for '{selected_category}'.")
+                st.session_state.style_analysis_desc = style_desc
+                st.session_state.style_analysis_error = None
+
+                # Construct the prompt immediately after successful analysis
+                # Ensure content_prompt is fetched correctly (it should be available from the widget state)
+                current_content_prompt = st.session_state.get("generator_style_content_prompt", "")
                 full_prompt = (
-                    f"Create YouTube thumbnail (16:9) depicting: {content_prompt}.\n\n"
-                    f"IMPORTANT: Visual style MUST strongly adhere to these characteristics derived from similar thumbnails:\n"
+                    f"Create a YouTube thumbnail image (16:9 aspect ratio) depicting: {current_content_prompt}.\n\n"
+                    f"IMPORTANT: The visual style MUST strongly adhere to the following characteristics derived from analyzing similar successful thumbnails:\n"
                     f"--- Style Description Start ---\n{style_desc}\n--- Style Description End ---\n\n"
-                    f"Ensure high quality, clear, integrates content naturally within style. Avoid text unless in content prompt."
-                )
-                st.caption("Sending combined prompt to DALL-E 3...")
-                # print(f"DALL-E Prompt (Styled): {full_prompt}") # Debug
+                    f"Ensure the image is high quality, clear, integrates the content naturally within the described style, and is suitable for a high-clickthrough YouTube thumbnail. Avoid text unless part of the content prompt."
+                 )
+                st.session_state.final_prompt_for_style_gen = full_prompt
+                st.session_state.style_analysis_done = True # Mark analysis as complete and prompt ready
+            st.rerun() # Rerun to update the UI based on the new state
 
-                response = client.images.generate(model="dall-e-3", prompt=full_prompt, size="1792x1024", quality="hd", n=1, response_format="b64_json")
+        # --- Display Prompt and Generate Button (if analysis was successful) ---
+        if st.session_state.style_analysis_done and st.session_state.final_prompt_for_style_gen:
+            st.markdown("---")
+            st.success("Analysis complete. Review the prompt below before generating.")
 
-                if response.data and response.data[0].b64_json:
-                    st.session_state.generated_image_b64 = response.data[0].b64_json
-                    st.session_state.generation_prompt_used = content_prompt # Use content prompt for filename hint
-                    st.session_state.generated_image_saved = False; st.session_state.generation_error = None
-                else:
-                    st.error("❌ Generation OK but no image data.")
-                    st.session_state.generation_error = "API success but no image data."
-            except Exception as e:
-                error_message = f"❌ Generation failed: {e}"
-                st.error(error_message)
-                if hasattr(e, 'response') and e.response: st.error(f"API Response: {e.response.text}")
-                if "safety system" in str(e).lower(): st.warning("Prompt possibly blocked by safety system.")
-                st.session_state.generation_error = error_message
-        st.rerun() # Rerun to show result/error
+            # Display the derived style description (optional)
+            if st.session_state.style_analysis_desc:
+                 with st.expander("View Derived Style Description (Used in Prompt)"):
+                     st.caption(st.session_state.style_analysis_desc)
 
-    display_generated_image_section() # Shared display
+            # Display the final prompt
+            with st.expander("View Final Prompt to be Sent", expanded=True): # Expand by default
+                st.text_area("Prompt:", value=st.session_state.final_prompt_for_style_gen, height=250, disabled=True, key="style_gen_final_prompt_display_confirm")
+
+            # Generate Button appears only after successful analysis and prompt prep
+            if st.button("2. ✨ Confirm and Generate Image", key="confirm_style_generate"):
+                final_prompt_to_use = st.session_state.final_prompt_for_style_gen
+                # Get latest content prompt value in case user edited it after analysis but before confirming generation
+                generation_content_prompt_hint = st.session_state.get("generator_style_content_prompt", "")
+
+                # Reset generation-specific state
+                st.session_state.generated_image_b64 = None
+                st.session_state.generation_error = None
+                st.session_state.generated_image_saved = False
+
+                with st.spinner("Generating thumbnail with DALL-E 3 using analyzed style..."):
+                    try:
+                        st.caption("Sending prompt to DALL-E 3...")
+                        # print(f"DALL-E Prompt (Styled): {final_prompt_to_use}") # Debug
+
+                        response = client.images.generate(
+                            model="dall-e-3", prompt=final_prompt_to_use,
+                            size="1792x1024", quality="hd", n=1, response_format="b64_json"
+                        )
+
+                        if response.data and response.data[0].b64_json:
+                            st.session_state.generated_image_b64 = response.data[0].b64_json
+                            st.session_state.generation_prompt_used = generation_content_prompt_hint # Use content for filename hint
+                            st.session_state.generation_error = None
+                            # Clear analysis state AFTER successful generation starts, ready for next attempt
+                            st.session_state.style_analysis_done = False
+                            st.session_state.final_prompt_for_style_gen = None
+                        else:
+                            st.error("❌ Generation OK but no image data received.")
+                            st.session_state.generation_error = "API success but no image data."
+                    except Exception as e:
+                        error_message = f"❌ Generation failed: {e}"
+                        st.error(error_message)
+                        if hasattr(e, 'response') and e.response: st.error(f"API Response: {e.response.text}")
+                        if "safety system" in str(e).lower(): st.warning("Prompt possibly blocked.")
+                        st.session_state.generation_error = error_message
+                        # Optionally reset analysis state on error too? Maybe not, user might want to retry generation.
+                        # st.session_state.style_analysis_done = False
+                        # st.session_state.final_prompt_for_style_gen = None
+
+                st.rerun() # Rerun to show result/error in the display section
+
+        # Display analysis error if it occurred and analysis isn't marked done
+        elif not st.session_state.style_analysis_done and st.session_state.style_analysis_error:
+             st.error(st.session_state.style_analysis_error)
+
+    # --- Display Generated Image and Save Options ---
+    # Moved header here to appear consistently above the result/error display
+    st.markdown("---")
+    st.header("Generation Result")
+    display_generated_image_section() # Shared display function handles showing image or error
+
 
 # ---------- Shared Function to Display Generated Image & Save Options --------
 def display_generated_image_section():
     """ Displays the generated image (if available) and options to save it. """
-    # Display error first if it occurred
+    # Display error first if it occurred during the last generation attempt
     if st.session_state.get("generation_error"):
         st.error(f"Previous generation attempt failed: {st.session_state.generation_error}")
 
+    # Display image and save options if an image was successfully generated
     if 'generated_image_b64' in st.session_state and st.session_state.generated_image_b64:
-        # st.subheader("Generated Thumbnail Result") # Headers now placed in calling functions
         is_saved = st.session_state.get('generated_image_saved', False)
         st.markdown('<div class="generated-image-container">', unsafe_allow_html=True)
         try:
@@ -928,7 +1029,9 @@ def display_generated_image_section():
                 st.warning("No suitable library categories found. Create a category folder first.")
                 save_category = None; save_button_disabled = True
             else:
-                save_category = st.selectbox("Choose destination category:", options=savable_categories, key="save_gen_category_select")
+                # Try to find a reasonable default category, e.g., based on prompt hint? Complex. Just default to first.
+                default_index = 0
+                save_category = st.selectbox("Choose destination category:", options=savable_categories, index=default_index, key="save_gen_category_select")
                 save_button_disabled = not save_category or is_saved
 
             prompt_part = re.sub(r'\W+', '_', st.session_state.get('generation_prompt_used', 'generated'))[:40].strip('_') or "generated"
@@ -958,7 +1061,10 @@ def main():
     keys_to_init = {
         'selected_category_folder': None, 'upload_cache': {}, 'confirm_delete_path': None,
         'generated_image_b64': None, 'generation_prompt_used': None, 'generated_image_saved': False,
-        'generation_error': None, 'nav_menu': None, 'selected_elements': {}, '_previous_nav_menu': None
+        'generation_error': None, 'nav_menu': None, 'selected_elements': {}, '_previous_nav_menu': None,
+        # State specific to category style generation flow
+        'style_analysis_done': False, 'style_analysis_desc': None, 'style_analysis_error': None,
+        'final_prompt_for_style_gen': None
     }
     for key, default_value in keys_to_init.items():
         if key not in st.session_state: st.session_state[key] = default_value
@@ -971,7 +1077,7 @@ def main():
         st.markdown("---")
 
         client = setup_openai_client()
-        if not client: st.warning("OpenAI API key needed for Analysis/Generation.", icon="🔑")
+        if not client: st.warning("OpenAI API key needed.", icon="🔑")
 
         # --- Navigation ---
         menu_options = ["Upload & Analyze", "Generate Directly", "Generate by Category Style", "Library Explorer"]
@@ -989,7 +1095,7 @@ def main():
 
         st.markdown("---")
         st.info(f"Library: `./{LIBRARY_DIR}`")
-        try:
+        try: # Download All Button
             zip_buffer, file_count = create_zip_of_library()
             if zip_buffer and file_count > 0:
                  st.download_button(label=f"⬇️ Download All ({file_count})", data=zip_buffer, file_name="thumbnail_library.zip", mime="application/zip", key="download_all", use_container_width=True)
@@ -1006,16 +1112,31 @@ def main():
     if st.session_state.confirm_delete_path:
         display_delete_confirmation()
     else:
-        # Clear generation state if navigating away from generator tabs
-        active_generator_tabs = ["Generate Directly", "Generate by Category Style", "Upload & Analyze"]
+        # Clear generation/analysis state IF navigating AWAY from the relevant tab
         previous_menu = st.session_state.get('_previous_nav_menu', None)
-        if previous_menu != menu: # Check if menu selection actually changed
-             if previous_menu in active_generator_tabs and menu not in active_generator_tabs:
-                 if st.session_state.get('generated_image_b64') is not None:
-                     # Clear state ONLY if navigating AWAY from ALL generator tabs
-                     st.session_state.generated_image_b64 = None; st.session_state.generation_prompt_used = None
-                     st.session_state.generated_image_saved = False; st.session_state.generation_error = None
-                     st.session_state.selected_elements = {} # Clear element selections too
+        navigated_away = (previous_menu != menu)
+
+        # Define which tabs hold sensitive/temporary state that needs clearing
+        tabs_with_gen_state = ["Generate Directly", "Generate by Category Style", "Upload & Analyze"]
+        tabs_with_style_analysis_state = ["Generate by Category Style"]
+
+        if navigated_away:
+            # Clear general generation state if leaving *any* generator tab
+            # Check if previous menu was a generator tab AND current menu is NOT
+            if previous_menu in tabs_with_gen_state and menu not in tabs_with_gen_state:
+                 st.session_state.generated_image_b64 = None
+                 st.session_state.generation_prompt_used = None
+                 st.session_state.generated_image_saved = False
+                 st.session_state.generation_error = None
+                 st.session_state.selected_elements = {} # Clear element selections
+
+            # Clear style analysis state specifically if leaving *that specific* tab
+            if previous_menu in tabs_with_style_analysis_state and menu not in tabs_with_style_analysis_state:
+                 st.session_state.style_analysis_done = False
+                 st.session_state.style_analysis_desc = None
+                 st.session_state.style_analysis_error = None
+                 st.session_state.final_prompt_for_style_gen = None
+
         # Update tracker AFTER potentially clearing state
         st.session_state['_previous_nav_menu'] = menu
 
